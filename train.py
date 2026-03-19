@@ -5,12 +5,13 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error
 import optuna
+# THE UPGRADE: We bring in the Drip Feed
+from torch.utils.data import TensorDataset, DataLoader
 from transformer_model import VolatilityTransformer
 
 torch.manual_seed(42)
 np.random.seed(42)
 
-# The Wall Street Judge survives
 class AsymmetricVolatilityLoss(nn.Module):
     def __init__(self, penalty_factor=3.0):
         super().__init__()
@@ -29,9 +30,10 @@ def create_sequences(data, seq_length):
         ys.append(data[i + seq_length, 1])
     return np.array(xs), np.array(ys)
 
-def run_optimized_pipeline(file_path="SPY_TRANSFORMER_clean.parquet", n_trials=10, n_splits=4):
+# THE UPGRADE: Target the HF data
+def run_optimized_pipeline(file_path="SPY_HF_clean.parquet", n_trials=10, n_splits=4):
     df = pd.read_parquet(file_path)
-    seq_length = 21
+    seq_length = 7 # One exact trading session
     
     test_start_idx = int(len(df) * 0.8)
     optuna_train_df = df.iloc[:test_start_idx]
@@ -45,12 +47,15 @@ def run_optimized_pipeline(file_path="SPY_TRANSFORMER_clean.parquet", n_trials=1
     X_train, y_train = create_sequences(train_scaled, seq_length)
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
     y_train_t = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+    
+    # THE SURGERY: Wrap the raw tensors in a dataset and a 128-batch loader
+    train_dataset = TensorDataset(X_train_t, y_train_t)
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
 
     print(f"2. The Thunderdome (Running {n_trials} Transformer Trials)...")
     optuna.logging.set_verbosity(optuna.logging.WARNING) 
     
     def objective(trial):
-        # The math constraint: d_model must be cleanly divisible by nhead
         d_model = trial.suggest_categorical('d_model', [32, 64])
         nhead = trial.suggest_categorical('nhead', [2, 4])
         num_layers = trial.suggest_int('num_layers', 1, 2)
@@ -58,17 +63,22 @@ def run_optimized_pipeline(file_path="SPY_TRANSFORMER_clean.parquet", n_trials=1
         lr = trial.suggest_float('lr', 0.0005, 0.005)
         
         model = VolatilityTransformer(input_size=3, d_model=d_model, nhead=nhead, num_layers=num_layers, dropout=dropout)
-        # THE FIX: weight_decay to stop the Transformer from overfitting
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5) 
         criterion = AsymmetricVolatilityLoss(penalty_factor=3.0)
         
-        for _ in range(30): 
+        # Reduced epochs from 30 to 15 because we are making hundreds of updates per epoch now
+        for _ in range(15): 
             model.train()
-            optimizer.zero_grad()
-            loss = criterion(model(X_train_t), y_train_t)
-            loss.backward()
-            optimizer.step()
-        return loss.item()
+            epoch_loss = 0
+            # THE DRIP FEED: Loop through the dataloader 128 rows at a time
+            for batch_X, batch_y in train_loader:
+                optimizer.zero_grad()
+                loss = criterion(model(batch_X), batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+        return epoch_loss / len(train_loader)
 
     study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials)
@@ -100,6 +110,10 @@ def run_optimized_pipeline(file_path="SPY_TRANSFORMER_clean.parquet", n_trials=1
         f_X_train_t = torch.tensor(f_X_train, dtype=torch.float32)
         f_y_train_t = torch.tensor(f_y_train, dtype=torch.float32).unsqueeze(1)
         f_X_test_t = torch.tensor(f_X_test, dtype=torch.float32)
+
+        # Batch the Walk-Forward training data too
+        f_train_dataset = TensorDataset(f_X_train_t, f_y_train_t)
+        f_train_loader = DataLoader(f_train_dataset, batch_size=128, shuffle=True)
         
         torch.manual_seed(42)
         fold_model = VolatilityTransformer(
@@ -112,14 +126,18 @@ def run_optimized_pipeline(file_path="SPY_TRANSFORMER_clean.parquet", n_trials=1
         fold_optimizer = torch.optim.Adam(fold_model.parameters(), lr=best['lr'], weight_decay=1e-5)
         criterion = AsymmetricVolatilityLoss(penalty_factor=3.0)
         
-        for epoch in range(40):
+        for epoch in range(15):
             fold_model.train()
-            fold_optimizer.zero_grad()
-            loss = criterion(fold_model(f_X_train_t), f_y_train_t)
-            loss.backward()
-            fold_optimizer.step()
+            # THE FIX: Feed the batch, not the whole tensor
+            for batch_X, batch_y in f_train_loader:
+                fold_optimizer.zero_grad()
+                loss = criterion(fold_model(batch_X), batch_y)
+                loss.backward()
+                fold_optimizer.step()
             
         fold_model.eval()
+        # torch.no_grad() temporarily shuts off the memory-heavy gradient calculations.
+        # This allows us to predict the whole test block at once without exploading the RAM.
         with torch.no_grad():
             preds_scaled = fold_model(f_X_test_t).numpy()
             
